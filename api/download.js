@@ -1,11 +1,11 @@
-// Vercel Edge Function - 24h Quota Bypass with Multiple Mirrors
-// Automatically rotates between multiple Google Drive accounts
-// If one gets 403, tries next mirror
+// ULTIMATE Google Drive Proxy - All Problems Fixed
+// Handles: Private files, 403 quota, 408 timeout, public files
 
 export const config = {
   runtime: 'edge',
 }
 
+// Your service account credentials (hardcoded for maximum reliability)
 const SERVICE_ACCOUNT = {
   "type": "service_account",
   "project_id": "composed-sensor-473512-a9",
@@ -14,25 +14,7 @@ const SERVICE_ACCOUNT = {
   "client_email": "moovied-site@composed-sensor-473512-a9.iam.gserviceaccount.com"
 }
 
-// FILE MIRRORS CONFIGURATION
-// Add multiple copies of the same file from different Google accounts
-const FILE_MIRRORS = {
-  // Example: "movie_name": ["fileID1", "fileID2", "fileID3"]
-  // Add your mirrors here:
-  
-  "example_movie": [
-    "1sGquZwp92VuDLLGThzkHQ4JyNVitDFaU",  // Mirror 1 (Account 1)
-    "1abc123xyz456def789ghi012jkl345mn",  // Mirror 2 (Account 2)
-    "1qwe098rty765uio432plk109mnb876vc"   // Mirror 3 (Account 3)
-  ]
-  
-  // Add more movies:
-  // "movie2": ["id1", "id2", "id3"],
-  // "movie3": ["id1", "id2", "id3"],
-}
-
-const quotaCache = new Map() // Track which files are in quota
-
+// JWT creation for OAuth
 async function createJWT(serviceAccount) {
   const header = { alg: 'RS256', typ: 'JWT' }
   const now = Math.floor(Date.now() / 1000)
@@ -51,6 +33,7 @@ async function createJWT(serviceAccount) {
   const encodedPayload = encodeBase64Url(payload)
   const signatureInput = `${encodedHeader}.${encodedPayload}`
   
+  // Extract and import private key
   const pemContents = serviceAccount.private_key
     .replace('-----BEGIN PRIVATE KEY-----', '')
     .replace('-----END PRIVATE KEY-----', '')
@@ -78,82 +61,18 @@ async function createJWT(serviceAccount) {
   return `${signatureInput}.${encodedSignature}`
 }
 
+// Get OAuth access token
 async function getAccessToken() {
   const jwt = await createJWT(SERVICE_ACCOUNT)
+
   const response = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`
   })
+
   const data = await response.json()
   return data.access_token
-}
-
-// Check if file has quota issues (403)
-async function checkFileQuota(fileId, accessToken) {
-  try {
-    const response = await fetch(
-      `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`,
-      {
-        method: 'HEAD',
-        headers: { 'Authorization': `Bearer ${accessToken}` },
-        signal: AbortSignal.timeout(5000)
-      }
-    )
-    
-    // 403 = quota exceeded
-    if (response.status === 403) {
-      return { hasQuota: true, status: 403 }
-    }
-    
-    // 200/206 = OK
-    if (response.ok) {
-      return { hasQuota: false, status: response.status }
-    }
-    
-    // Other errors
-    return { hasQuota: true, status: response.status }
-    
-  } catch (e) {
-    return { hasQuota: true, status: 'timeout' }
-  }
-}
-
-// Find working mirror from list
-async function findWorkingMirror(mirrors, accessToken) {
-  const results = []
-  
-  for (let i = 0; i < mirrors.length; i++) {
-    const fileId = mirrors[i]
-    
-    // Check cache first
-    const cached = quotaCache.get(fileId)
-    if (cached && cached.hasQuota && (Date.now() - cached.timestamp) < 3600000) {
-      console.log(`[SKIP] ${fileId} - Cached as quota exceeded`)
-      results.push({ fileId, hasQuota: true, source: 'cache' })
-      continue
-    }
-    
-    // Test file
-    const check = await checkFileQuota(fileId, accessToken)
-    console.log(`[TEST] Mirror ${i + 1}/${mirrors.length} - ${fileId} - Status: ${check.status}`)
-    
-    // Cache result
-    quotaCache.set(fileId, {
-      hasQuota: check.hasQuota,
-      timestamp: Date.now()
-    })
-    
-    results.push({ fileId, ...check })
-    
-    // Found working mirror!
-    if (!check.hasQuota) {
-      return { success: true, fileId, mirrorIndex: i, results }
-    }
-  }
-  
-  // All mirrors failed
-  return { success: false, results }
 }
 
 export default async function handler(request) {
@@ -171,13 +90,11 @@ export default async function handler(request) {
 
   const { searchParams } = new URL(request.url)
   const fileId = searchParams.get('id')
-  const movieKey = searchParams.get('movie') // Use movie key for mirrors
 
-  if (!fileId && !movieKey) {
+  if (!fileId) {
     return new Response(JSON.stringify({ 
-      error: 'Missing parameter',
-      usage: 'Use ?id=FILE_ID or ?movie=MOVIE_KEY (for auto-rotation)',
-      example: '?movie=example_movie'
+      error: 'Missing file ID',
+      usage: 'https://moovied-dns.vercel.app/api/download?id=FILE_ID'
     }), {
       status: 400,
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
@@ -185,132 +102,301 @@ export default async function handler(request) {
   }
 
   try {
-    const accessToken = await getAccessToken()
-    let targetFileId = fileId
-    let mirrorInfo = null
+    const debugInfo = { attempts: [] }
 
-    // If movie key provided, use mirror rotation
-    if (movieKey && FILE_MIRRORS[movieKey]) {
-      console.log(`[MIRROR MODE] ${movieKey} - Finding working mirror...`)
-      
-      const mirrors = FILE_MIRRORS[movieKey]
-      const result = await findWorkingMirror(mirrors, accessToken)
-      
-      if (!result.success) {
-        return new Response(JSON.stringify({ 
-          error: 'All mirrors exceeded quota',
-          movieKey: movieKey,
-          totalMirrors: mirrors.length,
-          results: result.results,
-          message: 'All copies of this file are currently quota-limited. Try again in 24 hours or add more mirrors.',
-          hint: 'Create more copies on different Google accounts'
-        }), {
-          status: 503,
-          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        })
+    // STRATEGY 1: Try public methods FIRST (fastest)
+    const publicResult = await tryPublicMethods(fileId, request)
+    if (publicResult.success) {
+      return publicResult.response
+    }
+    debugInfo.attempts.push({ method: 'public', success: false, error: publicResult.error })
+
+    // STRATEGY 2: Try quota bypass methods
+    const bypassResult = await tryQuotaBypass(fileId, request)
+    if (bypassResult.success) {
+      return bypassResult.response
+    }
+    debugInfo.attempts.push({ method: 'quota_bypass', success: false, error: bypassResult.error })
+
+    // STRATEGY 3: Try confirmation page extraction
+    const confirmResult = await tryConfirmationPage(fileId, request)
+    if (confirmResult.success) {
+      return confirmResult.response
+    }
+    debugInfo.attempts.push({ method: 'confirmation_page', success: false, error: confirmResult.error })
+
+    // STRATEGY 4: Try authenticated download (for private files)
+    try {
+      const accessToken = await getAccessToken()
+      const authResult = await tryAuthDownload(fileId, accessToken, request)
+      if (authResult.success) {
+        return authResult.response
       }
-      
-      targetFileId = result.fileId
-      mirrorInfo = {
-        movieKey: movieKey,
-        mirrorIndex: result.mirrorIndex + 1,
-        totalMirrors: mirrors.length,
-        testedMirrors: result.results.length
-      }
-      
-      console.log(`[SUCCESS] Using mirror ${result.mirrorIndex + 1}/${mirrors.length} - ${targetFileId}`)
+      debugInfo.attempts.push({ method: 'authenticated', success: false, error: authResult.error })
+    } catch (e) {
+      debugInfo.attempts.push({ method: 'authenticated', success: false, error: e.message })
     }
 
-    // Get file metadata
-    const metaResponse = await fetch(
-      `https://www.googleapis.com/drive/v3/files/${targetFileId}?fields=name,size,mimeType`,
-      {
-        headers: { 'Authorization': `Bearer ${accessToken}` }
-      }
-    )
-
-    if (!metaResponse.ok) {
-      return new Response(JSON.stringify({ 
-        error: 'File not found or not accessible',
-        fileId: targetFileId,
-        hint: 'Share the file with: ' + SERVICE_ACCOUNT.client_email,
-        note: 'Give "Viewer" permission'
-      }), {
-        status: 404,
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-      })
-    }
-
-    const metadata = await metaResponse.json()
-    const fileName = metadata.name || 'download'
-    const fileSize = metadata.size || '0'
-
-    // Download file
-    const downloadResponse = await fetch(
-      `https://www.googleapis.com/drive/v3/files/${targetFileId}?alt=media&supportsAllDrives=true`,
-      {
-        headers: { 
-          'Authorization': `Bearer ${accessToken}`,
-          'Range': request.headers.get('Range') || ''
-        }
-      }
-    )
-
-    if (!downloadResponse.ok) {
-      // 403 = Quota exceeded
-      if (downloadResponse.status === 403) {
-        // Mark this mirror as quota exceeded
-        quotaCache.set(targetFileId, {
-          hasQuota: true,
-          timestamp: Date.now()
-        })
-        
-        return new Response(JSON.stringify({ 
-          error: 'Download quota exceeded',
-          fileId: targetFileId,
-          message: 'This file has exceeded its 24-hour download quota',
-          hint: mirrorInfo ? 'Trying next mirror...' : 'Use ?movie=KEY for auto-rotation',
-          mirrorInfo: mirrorInfo
-        }), {
-          status: 403,
-          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        })
-      }
-      
-      throw new Error(`Download failed: ${downloadResponse.status}`)
-    }
-
-    // Success - stream file
-    const headers = {
-      'Content-Type': downloadResponse.headers.get('Content-Type') || 'application/octet-stream',
-      'Content-Length': downloadResponse.headers.get('Content-Length') || fileSize,
-      'Content-Disposition': `attachment; filename="${fileName}"`,
-      'Accept-Ranges': 'bytes',
-      'Access-Control-Allow-Origin': '*',
-      'Cache-Control': 'public, max-age=3600',
-      'X-File-Size': fileSize,
-      'X-File-Name': fileName
-    }
-
-    // Add mirror info to headers
-    if (mirrorInfo) {
-      headers['X-Mirror-Used'] = `${mirrorInfo.mirrorIndex}/${mirrorInfo.totalMirrors}`
-      headers['X-Movie-Key'] = mirrorInfo.movieKey
-    }
-
-    return new Response(downloadResponse.body, {
-      status: downloadResponse.status,
-      headers: headers
+    // All methods failed
+    return new Response(JSON.stringify({ 
+      error: 'Download failed',
+      message: 'All 4 strategies failed. Check debug info below.',
+      fileId: fileId,
+      serviceAccount: SERVICE_ACCOUNT.client_email,
+      instructions: [
+        '1. For public files: Right-click → Share → "Anyone with the link" → Viewer',
+        '2. For private files: Share with ' + SERVICE_ACCOUNT.client_email,
+        '3. Make sure file exists and is not deleted'
+      ],
+      debug: debugInfo,
+      testUrl: `https://drive.google.com/file/d/${fileId}/view`
+    }), {
+      status: 403,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
     })
 
   } catch (error) {
     return new Response(JSON.stringify({ 
       error: 'Server error',
-      message: error.message,
-      timestamp: new Date().toISOString()
+      message: error.message
     }), {
       status: 500,
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
     })
   }
+}
+
+// Method 1: Authenticated download (for private files)
+async function tryAuthDownload(fileId, accessToken, request) {
+  const endpoints = [
+    `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`,
+    `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`
+  ]
+
+  for (const url of endpoints) {
+    try {
+      const headers = { 'Authorization': `Bearer ${accessToken}`, 'Accept': '*/*' }
+      
+      const rangeHeader = request.headers.get('Range')
+      if (rangeHeader) headers['Range'] = rangeHeader
+
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 8000)
+
+      const response = await fetch(url, { headers, signal: controller.signal })
+      clearTimeout(timeout)
+
+      if (response.ok || response.status === 206) {
+        return { success: true, response: createProxyResponse(response) }
+      }
+      
+      if (response.status === 404) {
+        return { success: false, error: 'File not found or not shared with service account' }
+      }
+      if (response.status === 403) {
+        return { success: false, error: 'Permission denied - share file with service account' }
+      }
+    } catch (e) {
+      return { success: false, error: e.message }
+    }
+  }
+  return { success: false, error: 'All auth endpoints failed' }
+}
+
+// Method 2: Public download methods
+async function tryPublicMethods(fileId, request) {
+  const methods = [
+    {
+      url: `https://drive.usercontent.google.com/download?id=${fileId}&export=download&authuser=0&confirm=t`,
+      ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    },
+    {
+      url: `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t`,
+      ua: 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
+    },
+    {
+      url: `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+      ua: 'curl/8.0.1'
+    },
+    {
+      url: `https://docs.google.com/uc?export=download&id=${fileId}&confirm=t`,
+      ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+    }
+  ]
+
+  for (const method of methods) {
+    try {
+      const headers = { 
+        'User-Agent': method.ua, 
+        'Accept': '*/*',
+        'Referer': 'https://drive.google.com/',
+        'Origin': 'https://drive.google.com'
+      }
+      
+      const rangeHeader = request.headers.get('Range')
+      if (rangeHeader) headers['Range'] = rangeHeader
+
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 5000)
+
+      const response = await fetch(method.url, { 
+        headers, 
+        signal: controller.signal,
+        redirect: 'follow'
+      })
+      clearTimeout(timeout)
+
+      const contentType = response.headers.get('content-type') || ''
+      const contentLength = parseInt(response.headers.get('content-length') || '0')
+      
+      // Check if it's a valid file response
+      if ((response.ok || response.status === 206)) {
+        // Skip small HTML error pages
+        if (contentType.includes('text/html') && contentLength < 50000) {
+          continue
+        }
+        if (!contentType.includes('text/html') || contentLength > 50000) {
+          return { success: true, response: createProxyResponse(response) }
+        }
+      }
+    } catch (e) {
+      continue
+    }
+  }
+  return { success: false, error: 'All public methods returned HTML or failed' }
+}
+
+// Method 3: Quota bypass methods
+async function tryQuotaBypass(fileId, request) {
+  const uuid = () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0
+    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16)
+  })
+
+  const methods = [
+    { url: `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t&uuid=${uuid()}`, ua: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15' },
+    { url: `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t&uuid=${uuid()}`, ua: 'curl/7.88.0' },
+    { url: `https://docs.google.com/uc?id=${fileId}&export=download`, ua: 'Wget/1.21.3' },
+    { url: `https://drive.google.com/uc?export=download&id=${fileId}`, ua: 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36' }
+  ]
+
+  for (const method of methods) {
+    try {
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 5000)
+
+      const response = await fetch(method.url, {
+        headers: { 'User-Agent': method.ua, 'Accept': '*/*' },
+        signal: controller.signal
+      })
+      clearTimeout(timeout)
+
+      const contentType = response.headers.get('content-type') || ''
+      if ((response.ok || response.status === 206) && !contentType.includes('text/html')) {
+        return { success: true, response: createProxyResponse(response) }
+      }
+    } catch (e) {
+      continue
+    }
+  }
+  return { success: false }
+}
+
+// Method 4: Confirmation page extraction
+async function tryConfirmationPage(fileId, request) {
+  try {
+    const confirmUrl = `https://drive.google.com/uc?export=download&id=${fileId}`
+    
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 8000)
+
+    const response = await fetch(confirmUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html'
+      },
+      signal: controller.signal
+    })
+    clearTimeout(timeout)
+
+    if (!response.ok) return { success: false }
+
+    const html = await response.text()
+    
+    const patterns = [
+      /href="(https:\/\/drive\.usercontent\.google\.com\/download\?[^"]+)"/i,
+      /href="(https:\/\/[^"]*uc\?export=download[^"]*confirm=[^"]*uuid=[^"]*)"/i,
+      /"downloadUrl"\s*:\s*"([^"]+)"/i,
+      /action="([^"]*uc\?export=download[^"]*)"/i,
+      /href="(\/uc\?export=download&[^"]+)"/i
+    ]
+
+    for (const pattern of patterns) {
+      const match = html.match(pattern)
+      if (match) {
+        let downloadUrl = match[1]
+          .replace(/&amp;/g, '&')
+          .replace(/\\u003d/g, '=')
+          .replace(/\\u0026/g, '&')
+          .replace(/\\\//g, '/')
+
+        if (downloadUrl.startsWith('/')) {
+          downloadUrl = 'https://drive.google.com' + downloadUrl
+        }
+
+        try {
+          const finalController = new AbortController()
+          const finalTimeout = setTimeout(() => finalController.abort(), 6000)
+
+          const finalResponse = await fetch(downloadUrl, {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+              'Referer': confirmUrl,
+              'Accept': '*/*'
+            },
+            signal: finalController.signal
+          })
+          clearTimeout(finalTimeout)
+
+          const contentType = finalResponse.headers.get('content-type') || ''
+          if (finalResponse.ok && !contentType.includes('text/html')) {
+            return { success: true, response: createProxyResponse(finalResponse) }
+          }
+        } catch (e) {
+          continue
+        }
+      }
+    }
+  } catch (e) {
+    return { success: false }
+  }
+  return { success: false }
+}
+
+function createProxyResponse(originalResponse) {
+  const headers = new Headers()
+  
+  const headersToProxy = [
+    'content-type', 'content-length', 'content-disposition',
+    'content-range', 'accept-ranges', 'cache-control',
+    'etag', 'last-modified'
+  ]
+
+  headersToProxy.forEach(header => {
+    const value = originalResponse.headers.get(header)
+    if (value) headers.set(header, value)
+  })
+
+  headers.set('Access-Control-Allow-Origin', '*')
+  headers.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS')
+  headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges')
+
+  if (!headers.has('cache-control')) {
+    headers.set('Cache-Control', 'public, max-age=3600')
+  }
+
+  return new Response(originalResponse.body, {
+    status: originalResponse.status,
+    headers: headers
+  })
 }
