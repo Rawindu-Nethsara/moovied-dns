@@ -102,42 +102,54 @@ export default async function handler(request) {
   }
 
   try {
-    // STRATEGY 1: Try authenticated download first (most reliable for private files)
+    const debugInfo = { attempts: [] }
+
+    // STRATEGY 1: Try public methods FIRST (fastest)
+    const publicResult = await tryPublicMethods(fileId, request)
+    if (publicResult.success) {
+      return publicResult.response
+    }
+    debugInfo.attempts.push({ method: 'public', success: false, error: publicResult.error })
+
+    // STRATEGY 2: Try quota bypass methods
+    const bypassResult = await tryQuotaBypass(fileId, request)
+    if (bypassResult.success) {
+      return bypassResult.response
+    }
+    debugInfo.attempts.push({ method: 'quota_bypass', success: false, error: bypassResult.error })
+
+    // STRATEGY 3: Try confirmation page extraction
+    const confirmResult = await tryConfirmationPage(fileId, request)
+    if (confirmResult.success) {
+      return confirmResult.response
+    }
+    debugInfo.attempts.push({ method: 'confirmation_page', success: false, error: confirmResult.error })
+
+    // STRATEGY 4: Try authenticated download (for private files)
     try {
       const accessToken = await getAccessToken()
       const authResult = await tryAuthDownload(fileId, accessToken, request)
       if (authResult.success) {
         return authResult.response
       }
+      debugInfo.attempts.push({ method: 'authenticated', success: false, error: authResult.error })
     } catch (e) {
-      console.log('Auth failed, trying public methods')
-    }
-
-    // STRATEGY 2: Try public download methods (fast for public files)
-    const publicResult = await tryPublicMethods(fileId, request)
-    if (publicResult.success) {
-      return publicResult.response
-    }
-
-    // STRATEGY 3: Try quota bypass methods (for quota-exceeded files)
-    const bypassResult = await tryQuotaBypass(fileId, request)
-    if (bypassResult.success) {
-      return bypassResult.response
-    }
-
-    // STRATEGY 4: Extract from confirmation page (last resort)
-    const confirmResult = await tryConfirmationPage(fileId, request)
-    if (confirmResult.success) {
-      return confirmResult.response
+      debugInfo.attempts.push({ method: 'authenticated', success: false, error: e.message })
     }
 
     // All methods failed
     return new Response(JSON.stringify({ 
       error: 'Download failed',
-      message: 'All methods exhausted. File may be deleted, heavily restricted, or require different permissions.',
+      message: 'All 4 strategies failed. Check debug info below.',
       fileId: fileId,
       serviceAccount: SERVICE_ACCOUNT.client_email,
-      hint: 'Share the file with: ' + SERVICE_ACCOUNT.client_email
+      instructions: [
+        '1. For public files: Right-click → Share → "Anyone with the link" → Viewer',
+        '2. For private files: Share with ' + SERVICE_ACCOUNT.client_email,
+        '3. Make sure file exists and is not deleted'
+      ],
+      debug: debugInfo,
+      testUrl: `https://drive.google.com/file/d/${fileId}/view`
     }), {
       status: 403,
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
@@ -177,11 +189,18 @@ async function tryAuthDownload(fileId, accessToken, request) {
       if (response.ok || response.status === 206) {
         return { success: true, response: createProxyResponse(response) }
       }
+      
+      if (response.status === 404) {
+        return { success: false, error: 'File not found or not shared with service account' }
+      }
+      if (response.status === 403) {
+        return { success: false, error: 'Permission denied - share file with service account' }
+      }
     } catch (e) {
-      continue
+      return { success: false, error: e.message }
     }
   }
-  return { success: false }
+  return { success: false, error: 'All auth endpoints failed' }
 }
 
 // Method 2: Public download methods
@@ -207,7 +226,12 @@ async function tryPublicMethods(fileId, request) {
 
   for (const method of methods) {
     try {
-      const headers = { 'User-Agent': method.ua, 'Accept': '*/*' }
+      const headers = { 
+        'User-Agent': method.ua, 
+        'Accept': '*/*',
+        'Referer': 'https://drive.google.com/',
+        'Origin': 'https://drive.google.com'
+      }
       
       const rangeHeader = request.headers.get('Range')
       if (rangeHeader) headers['Range'] = rangeHeader
@@ -215,18 +239,31 @@ async function tryPublicMethods(fileId, request) {
       const controller = new AbortController()
       const timeout = setTimeout(() => controller.abort(), 5000)
 
-      const response = await fetch(method.url, { headers, signal: controller.signal })
+      const response = await fetch(method.url, { 
+        headers, 
+        signal: controller.signal,
+        redirect: 'follow'
+      })
       clearTimeout(timeout)
 
       const contentType = response.headers.get('content-type') || ''
-      if ((response.ok || response.status === 206) && !contentType.includes('text/html')) {
-        return { success: true, response: createProxyResponse(response) }
+      const contentLength = parseInt(response.headers.get('content-length') || '0')
+      
+      // Check if it's a valid file response
+      if ((response.ok || response.status === 206)) {
+        // Skip small HTML error pages
+        if (contentType.includes('text/html') && contentLength < 50000) {
+          continue
+        }
+        if (!contentType.includes('text/html') || contentLength > 50000) {
+          return { success: true, response: createProxyResponse(response) }
+        }
       }
     } catch (e) {
       continue
     }
   }
-  return { success: false }
+  return { success: false, error: 'All public methods returned HTML or failed' }
 }
 
 // Method 3: Quota bypass methods
