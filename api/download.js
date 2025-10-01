@@ -3,7 +3,7 @@
 
 export const config = {
   runtime: 'edge',
-  maxDuration: 300, // 5 minutes max for Vercel Edge
+  maxDuration: 900, // 15 minutes max (Vercel Pro limit)
 }
 
 const SERVICE_ACCOUNT = {
@@ -68,6 +68,69 @@ async function getAccessToken() {
   return data.access_token
 }
 
+// GET FILE METADATA (name, size, mimeType)
+async function getFileMetadata(fileId) {
+  const metadata = { name: null, size: null, mimeType: null }
+  
+  // Try public metadata API first (no auth needed)
+  const publicUrls = [
+    `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size,mimeType`,
+    `https://www.googleapis.com/drive/v3/files/${fileId}?key=AIzaSyBuddha&fields=name,size,mimeType`
+  ]
+  
+  for (const url of publicUrls) {
+    try {
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 5000) // Fast metadata fetch
+      
+      const response = await fetch(url, {
+        headers: { 'Accept': 'application/json' },
+        signal: controller.signal
+      })
+      clearTimeout(timeout)
+      
+      if (response.ok) {
+        const data = await response.json()
+        metadata.name = data.name || null
+        metadata.size = data.size || null
+        metadata.mimeType = data.mimeType || null
+        if (metadata.name) return metadata
+      }
+    } catch (e) {
+      continue
+    }
+  }
+
+  // Try authenticated metadata API
+  try {
+    const accessToken = await getAccessToken()
+    const authUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name,size,mimeType&supportsAllDrives=true`
+    
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 5000)
+    
+    const response = await fetch(authUrl, {
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Accept': 'application/json'
+      },
+      signal: controller.signal
+    })
+    clearTimeout(timeout)
+    
+    if (response.ok) {
+      const data = await response.json()
+      metadata.name = data.name || null
+      metadata.size = data.size || null
+      metadata.mimeType = data.mimeType || null
+    }
+  } catch (e) {
+    // Continue without metadata
+  }
+
+  return metadata
+}
+
 export default async function handler(request) {
   if (request.method === 'OPTIONS') {
     return new Response(null, {
@@ -95,6 +158,11 @@ export default async function handler(request) {
   }
 
   try {
+    // Get file metadata first (name, size, mimeType)
+    let fileMetadata = await getFileMetadata(fileId)
+    
+    // Store metadata for later use in response
+    request.fileMetadata = fileMetadata
     // PRIORITY 1: Ultra-fast quota bypass methods (works for 24h limit)
     const quotaBypassResult = await tryQuotaBypassAdvanced(fileId, request)
     if (quotaBypassResult.success) {
@@ -218,7 +286,7 @@ async function tryQuotaBypassAdvanced(fileId, request) {
       if (rangeHeader) method.headers['Range'] = rangeHeader
 
       const controller = new AbortController()
-      const timeout = setTimeout(() => controller.abort(), 15000) // 15s timeout
+      const timeout = setTimeout(() => controller.abort(), 60000) // 60s timeout (increased)
 
       const response = await fetch(method.url, { 
         headers: method.headers,
@@ -238,7 +306,7 @@ async function tryQuotaBypassAdvanced(fileId, request) {
         }
         // Accept non-HTML or large files
         if (!contentType.includes('text/html') || contentLength > 100000) {
-          return { success: true, response: createStreamResponse(response) }
+          return { success: true, response: createStreamResponse(response, request.fileMetadata) }
         }
       }
     } catch (e) {
@@ -270,7 +338,7 @@ async function tryLargeFileStream(fileId, request) {
 
       // Extended timeout for large files
       const controller = new AbortController()
-      const timeout = setTimeout(() => controller.abort(), 30000) // 30s
+      const timeout = setTimeout(() => controller.abort(), 120000) // 120s (2 minutes)
 
       const response = await fetch(url, { 
         headers,
@@ -282,7 +350,7 @@ async function tryLargeFileStream(fileId, request) {
       const contentType = response.headers.get('content-type') || ''
       
       if ((response.ok || response.status === 206) && !contentType.includes('text/html')) {
-        return { success: true, response: createStreamResponse(response) }
+        return { success: true, response: createStreamResponse(response, request.fileMetadata) }
       }
     } catch (e) {
       continue
@@ -297,7 +365,7 @@ async function tryConfirmationBypass(fileId, request) {
     const confirmUrl = `https://drive.google.com/uc?export=download&id=${fileId}`
     
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 12000)
+    const timeout = setTimeout(() => controller.abort(), 60000) // 60s
 
     const response = await fetch(confirmUrl, {
       headers: {
@@ -347,7 +415,7 @@ async function tryConfirmationBypass(fileId, request) {
           if (rangeHeader) finalHeaders['Range'] = rangeHeader
 
           const finalController = new AbortController()
-          const finalTimeout = setTimeout(() => finalController.abort(), 20000)
+          const finalTimeout = setTimeout(() => finalController.abort(), 120000) // 120s
 
           const finalResponse = await fetch(downloadUrl, {
             headers: finalHeaders,
@@ -358,7 +426,7 @@ async function tryConfirmationBypass(fileId, request) {
 
           const contentType = finalResponse.headers.get('content-type') || ''
           if ((finalResponse.ok || finalResponse.status === 206) && !contentType.includes('text/html')) {
-            return { success: true, response: createStreamResponse(finalResponse) }
+            return { success: true, response: createStreamResponse(finalResponse, request.fileMetadata) }
           }
         } catch (e) {
           continue
@@ -390,7 +458,7 @@ async function tryAuthDownload(fileId, accessToken, request) {
       if (rangeHeader) headers['Range'] = rangeHeader
 
       const controller = new AbortController()
-      const timeout = setTimeout(() => controller.abort(), 20000)
+      const timeout = setTimeout(() => controller.abort(), 120000) // 120s
 
       const response = await fetch(url, { 
         headers,
@@ -399,7 +467,7 @@ async function tryAuthDownload(fileId, accessToken, request) {
       clearTimeout(timeout)
 
       if (response.ok || response.status === 206) {
-        return { success: true, response: createStreamResponse(response) }
+        return { success: true, response: createStreamResponse(response, request.fileMetadata) }
       }
     } catch (e) {
       continue
@@ -423,7 +491,7 @@ async function tryPublicDirect(fileId, request) {
       if (rangeHeader) headers['Range'] = rangeHeader
 
       const controller = new AbortController()
-      const timeout = setTimeout(() => controller.abort(), 10000)
+      const timeout = setTimeout(() => controller.abort(), 60000) // 60s
 
       const response = await fetch(method.url, { 
         headers,
@@ -433,7 +501,7 @@ async function tryPublicDirect(fileId, request) {
 
       const contentType = response.headers.get('content-type') || ''
       if ((response.ok || response.status === 206) && !contentType.includes('text/html')) {
-        return { success: true, response: createStreamResponse(response) }
+        return { success: true, response: createStreamResponse(response, request.fileMetadata) }
       }
     } catch (e) {
       continue
@@ -443,7 +511,7 @@ async function tryPublicDirect(fileId, request) {
 }
 
 // CREATE STREAMING RESPONSE - Optimized for large files
-function createStreamResponse(originalResponse) {
+function createStreamResponse(originalResponse, fileMetadata = {}) {
   const headers = new Headers()
   
   const headersToProxy = [
@@ -456,6 +524,23 @@ function createStreamResponse(originalResponse) {
     const value = originalResponse.headers.get(header)
     if (value) headers.set(header, value)
   })
+
+  // Set filename and size from metadata if available
+  if (fileMetadata.name && !headers.has('content-disposition')) {
+    const sanitizedName = fileMetadata.name.replace(/[^\x20-\x7E]/g, '')
+    const encodedName = encodeURIComponent(fileMetadata.name)
+    headers.set('Content-Disposition', `attachment; filename="${sanitizedName}"; filename*=UTF-8''${encodedName}`)
+  }
+
+  // Set content length if available
+  if (fileMetadata.size && !headers.has('content-length')) {
+    headers.set('Content-Length', fileMetadata.size)
+  }
+
+  // Set content type if available
+  if (fileMetadata.mimeType && !headers.has('content-type')) {
+    headers.set('Content-Type', fileMetadata.mimeType)
+  }
 
   // CORS headers
   headers.set('Access-Control-Allow-Origin', '*')
