@@ -1,10 +1,89 @@
-// Google Drive Proxy - Enhanced Vercel Edge Function
+// Google Drive Proxy - Private Files Support with Service Account
+// Handles: Private files, 403 quota, 408 timeout
+
 export const config = {
   runtime: 'edge',
 }
 
+// Base64 decode helper for edge runtime
+function base64Decode(str) {
+  return atob(str)
+}
+
+// Create JWT for Google OAuth
+async function createJWT(serviceAccount, scopes) {
+  const header = {
+    alg: 'RS256',
+    typ: 'JWT'
+  }
+
+  const now = Math.floor(Date.now() / 1000)
+  const payload = {
+    iss: serviceAccount.client_email,
+    scope: scopes.join(' '),
+    aud: 'https://oauth2.googleapis.com/token',
+    exp: now + 3600,
+    iat: now
+  }
+
+  const encodedHeader = btoa(JSON.stringify(header)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_')
+  const encodedPayload = btoa(JSON.stringify(payload)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_')
+  
+  const signatureInput = `${encodedHeader}.${encodedPayload}`
+  
+  // Import private key
+  const pemHeader = '-----BEGIN PRIVATE KEY-----'
+  const pemFooter = '-----END PRIVATE KEY-----'
+  const pemContents = serviceAccount.private_key.substring(
+    pemHeader.length,
+    serviceAccount.private_key.length - pemFooter.length - 1
+  ).replace(/\s/g, '')
+  
+  const binaryKey = Uint8Array.from(atob(pemContents), c => c.charCodeAt(0))
+  
+  const key = await crypto.subtle.importKey(
+    'pkcs8',
+    binaryKey,
+    {
+      name: 'RSASSA-PKCS1-v1_5',
+      hash: 'SHA-256'
+    },
+    false,
+    ['sign']
+  )
+
+  const signature = await crypto.subtle.sign(
+    'RSASSA-PKCS1-v1_5',
+    key,
+    new TextEncoder().encode(signatureInput)
+  )
+
+  const encodedSignature = btoa(String.fromCharCode(...new Uint8Array(signature)))
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+
+  return `${signatureInput}.${encodedSignature}`
+}
+
+// Get access token from Google
+async function getAccessToken(serviceAccount) {
+  const jwt = await createJWT(serviceAccount, [
+    'https://www.googleapis.com/auth/drive.readonly'
+  ])
+
+  const response = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`
+  })
+
+  const data = await response.json()
+  return data.access_token
+}
+
 export default async function handler(request) {
-  // Handle CORS preflight
+  // Handle CORS
   if (request.method === 'OPTIONS') {
     return new Response(null, {
       status: 204,
@@ -19,11 +98,12 @@ export default async function handler(request) {
 
   const { searchParams } = new URL(request.url)
   const fileId = searchParams.get('id')
+  const useAuth = searchParams.get('private') === 'true' // Add ?private=true for private files
 
   if (!fileId) {
     return new Response(JSON.stringify({ 
       error: 'Missing file ID',
-      usage: 'https://your-domain.vercel.app/api/download?id=FILE_ID'
+      usage: 'Public: ?id=FILE_ID | Private: ?id=FILE_ID&private=true'
     }), {
       status: 400,
       headers: { 
@@ -34,110 +114,43 @@ export default async function handler(request) {
   }
 
   try {
-    // Strategy 1: Try direct download endpoints with various methods
-    const directMethods = [
-      {
-        url: `https://drive.usercontent.google.com/download?id=${fileId}&export=download&authuser=0&confirm=t`,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': '*/*',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Referer': 'https://drive.google.com/',
-          'Origin': 'https://drive.google.com',
-          'Sec-Fetch-Dest': 'document',
-          'Sec-Fetch-Mode': 'navigate',
-          'Sec-Fetch-Site': 'same-site'
-        }
-      },
-      {
-        url: `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t`,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
-          'Accept': '*/*',
-          'From': 'googlebot@google.com'
-        }
-      },
-      {
-        url: `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`,
-        headers: {
-          'User-Agent': 'curl/8.0.1',
-          'Accept': 'application/octet-stream'
-        }
-      },
-      {
-        url: `https://docs.google.com/uc?export=download&id=${fileId}&confirm=t`,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-          'Accept': '*/*'
-        }
-      },
-      {
-        url: `https://drive.google.com/uc?export=download&id=${fileId}`,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
-          'Accept': '*/*'
-        }
-      }
-    ]
-
-    // Try all direct methods
-    for (const method of directMethods) {
-      try {
-        const rangeHeader = request.headers.get('Range')
-        if (rangeHeader) {
-          method.headers['Range'] = rangeHeader
-        }
-
-        const response = await fetch(method.url, {
-          headers: method.headers,
-          redirect: 'follow'
-        })
-
-        if (await isValidFileResponse(response)) {
-          return createProxyResponse(response)
-        }
-      } catch (e) {
-        continue
+    // Method 1: Try public download first (fast, no auth)
+    if (!useAuth) {
+      const publicResult = await tryPublicDownload(fileId, request)
+      if (publicResult.success) {
+        return publicResult.response
       }
     }
 
-    // Strategy 2: Try to extract download link from confirmation page
-    const confirmResult = await tryConfirmationPage(fileId, request)
-    if (confirmResult.success) {
-      return confirmResult.response
+    // Method 2: Try with authentication (for private files)
+    // You need to set this environment variable in Vercel
+    const serviceAccountJson = process.env.GOOGLE_SERVICE_ACCOUNT
+    
+    if (serviceAccountJson) {
+      const serviceAccount = JSON.parse(serviceAccountJson)
+      const accessToken = await getAccessToken(serviceAccount)
+      
+      // Download with authentication
+      const authResult = await downloadWithAuth(fileId, accessToken, request)
+      if (authResult.success) {
+        return authResult.response
+      }
     }
 
-    // Strategy 3: Try alternative endpoints with UUID
-    const uuid = generateUUID()
-    const alternativeUrls = [
-      `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t&uuid=${uuid}`,
-      `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t&uuid=${uuid}`,
-      `https://docs.google.com/uc?id=${fileId}&export=download`
-    ]
-
-    for (const url of alternativeUrls) {
-      try {
-        const response = await fetch(url, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': '*/*'
-          }
-        })
-
-        if (await isValidFileResponse(response)) {
-          return createProxyResponse(response)
-        }
-      } catch (e) {
-        continue
-      }
+    // Method 3: Fallback to aggressive public methods
+    const aggressiveResult = await tryAggressiveMethods(fileId, request)
+    if (aggressiveResult.success) {
+      return aggressiveResult.response
     }
 
     // All methods failed
     return new Response(JSON.stringify({ 
       error: 'Download failed',
-      message: 'Unable to download file after trying all methods. Please verify: 1) File exists, 2) Sharing is set to "Anyone with the link can view", 3) File is not restricted by organization policies.',
+      message: serviceAccountJson 
+        ? 'File not accessible. Make sure the file is shared with the service account email.'
+        : 'File is private. Add ?private=true or share the file publicly.',
       fileId: fileId,
-      hint: 'Go to Google Drive → Right-click file → Share → Change to "Anyone with the link" → Viewer'
+      hint: 'For private files: Share file with service account or add ?private=true'
     }), {
       status: 403,
       headers: { 
@@ -150,7 +163,7 @@ export default async function handler(request) {
     return new Response(JSON.stringify({ 
       error: 'Server error',
       message: error.message,
-      fileId: fileId
+      stack: error.stack
     }), {
       status: 500,
       headers: { 
@@ -161,119 +174,27 @@ export default async function handler(request) {
   }
 }
 
-// Check if response is a valid file (not an error page)
-async function isValidFileResponse(response) {
-  if (!response.ok && response.status !== 206) {
-    return false
-  }
-
-  const contentType = response.headers.get('content-type') || ''
-  const contentLength = parseInt(response.headers.get('content-length') || '0')
-
-  // If it's HTML, check if it's a small error page
-  if (contentType.includes('text/html')) {
-    if (contentLength > 0 && contentLength < 100000) {
-      // Small HTML file - likely error page
-      const text = await response.clone().text()
-      if (text.includes('Google Drive') && (text.includes('quota') || text.includes('error') || text.includes('access'))) {
-        return false
-      }
-      // Could be actual small HTML file
-      if (contentLength < 5000) {
-        return false
-      }
-    }
-  }
-
-  // Valid if: has content-length, or is streaming, or is not HTML
-  return contentLength > 0 || !contentType.includes('text/html')
-}
-
-// Try to extract download link from Google Drive confirmation page
-async function tryConfirmationPage(fileId, request) {
+// Download with OAuth authentication
+async function downloadWithAuth(fileId, accessToken, request) {
   try {
-    const confirmUrl = `https://drive.google.com/uc?export=download&id=${fileId}`
+    const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`
     
-    const response = await fetch(confirmUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://drive.google.com/'
-      }
-    })
-
-    if (!response.ok) {
-      return { success: false }
+    const headers = {
+      'Authorization': `Bearer ${accessToken}`,
+      'Accept': '*/*'
     }
 
-    const html = await response.text()
+    const rangeHeader = request.headers.get('Range')
+    if (rangeHeader) {
+      headers['Range'] = rangeHeader
+    }
 
-    // Multiple regex patterns to find download URL
-    const patterns = [
-      // Pattern 1: Direct download link with uuid
-      /href="(https:\/\/drive\.usercontent\.google\.com\/download\?[^"]+)"/i,
-      // Pattern 2: Export download with confirm
-      /href="(https:\/\/[^"]*uc\?export=download[^"]*confirm=[^"]*uuid=[^"]*)"/i,
-      // Pattern 3: JSON format
-      /"downloadUrl"\s*:\s*"([^"]+)"/i,
-      // Pattern 4: Form action
-      /action="([^"]*uc\?export=download[^"]*)"/i,
-      // Pattern 5: Relative URL
-      /href="(\/uc\?export=download&[^"]+)"/i,
-      // Pattern 6: Window location redirect
-      /window\.location\s*=\s*['"](https?:\/\/[^'"]+)['"]?/i,
-      // Pattern 7: Download attribute
-      /download[^>]*href="([^"]+)"/i
-    ]
+    const response = await fetch(url, { headers })
 
-    for (const pattern of patterns) {
-      const match = html.match(pattern)
-      if (match) {
-        let downloadUrl = match[1]
-          .replace(/&amp;/g, '&')
-          .replace(/\\u003d/g, '=')
-          .replace(/\\u0026/g, '&')
-          .replace(/\\\//g, '/')
-          .replace(/\\"/g, '"')
-
-        // Make sure URL is absolute
-        if (downloadUrl.startsWith('/')) {
-          downloadUrl = 'https://drive.google.com' + downloadUrl
-        }
-
-        // Skip if it's just the same confirmation URL
-        if (downloadUrl.includes('uc?export=download') && !downloadUrl.includes('confirm=') && !downloadUrl.includes('uuid=')) {
-          continue
-        }
-
-        try {
-          const downloadHeaders = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': '*/*',
-            'Referer': confirmUrl,
-            'Origin': 'https://drive.google.com'
-          }
-
-          const rangeHeader = request.headers.get('Range')
-          if (rangeHeader) {
-            downloadHeaders['Range'] = rangeHeader
-          }
-
-          const finalResponse = await fetch(downloadUrl, {
-            headers: downloadHeaders,
-            redirect: 'follow'
-          })
-
-          if (await isValidFileResponse(finalResponse)) {
-            return { 
-              success: true, 
-              response: createProxyResponse(finalResponse) 
-            }
-          }
-        } catch (e) {
-          continue
-        }
+    if (response.ok || response.status === 206) {
+      return { 
+        success: true, 
+        response: createProxyResponse(response) 
       }
     }
 
@@ -283,12 +204,112 @@ async function tryConfirmationPage(fileId, request) {
   }
 }
 
-function generateUUID() {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+// Try public download (no authentication)
+async function tryPublicDownload(fileId, request) {
+  const methods = [
+    {
+      url: `https://drive.usercontent.google.com/download?id=${fileId}&export=download&authuser=0&confirm=t`,
+      ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    },
+    {
+      url: `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t`,
+      ua: 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
+    },
+    {
+      url: `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+      ua: 'curl/8.0.1'
+    }
+  ]
+
+  for (const method of methods) {
+    try {
+      const headers = {
+        'User-Agent': method.ua,
+        'Accept': '*/*'
+      }
+
+      const rangeHeader = request.headers.get('Range')
+      if (rangeHeader) {
+        headers['Range'] = rangeHeader
+      }
+
+      // Abort after 5 seconds to prevent 408 timeout
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 5000)
+
+      const response = await fetch(method.url, {
+        headers,
+        signal: controller.signal,
+        redirect: 'follow'
+      })
+
+      clearTimeout(timeoutId)
+
+      const contentType = response.headers.get('content-type') || ''
+      
+      if ((response.ok || response.status === 206) && !contentType.includes('text/html')) {
+        return { 
+          success: true, 
+          response: createProxyResponse(response) 
+        }
+      }
+    } catch (error) {
+      continue
+    }
+  }
+
+  return { success: false }
+}
+
+// Aggressive methods for quota-exceeded files
+async function tryAggressiveMethods(fileId, request) {
+  const uuid = () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
     const r = Math.random() * 16 | 0
-    const v = c === 'x' ? r : (r & 0x3 | 0x8)
-    return v.toString(16)
+    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16)
   })
+
+  const methods = [
+    `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t&uuid=${uuid()}`,
+    `https://docs.google.com/uc?export=download&id=${fileId}&confirm=t`,
+    `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t&uuid=${uuid()}`
+  ]
+
+  const userAgents = [
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
+    'curl/7.88.0',
+    'Wget/1.21.3'
+  ]
+
+  for (const url of methods) {
+    for (const ua of userAgents) {
+      try {
+        const controller = new AbortController()
+        const timeoutId = setTimeout(() => controller.abort(), 5000)
+
+        const response = await fetch(url, {
+          headers: {
+            'User-Agent': ua,
+            'Accept': '*/*'
+          },
+          signal: controller.signal
+        })
+
+        clearTimeout(timeoutId)
+
+        const contentType = response.headers.get('content-type') || ''
+        if ((response.ok || response.status === 206) && !contentType.includes('text/html')) {
+          return { 
+            success: true, 
+            response: createProxyResponse(response) 
+          }
+        }
+      } catch (error) {
+        continue
+      }
+    }
+  }
+
+  return { success: false }
 }
 
 function createProxyResponse(originalResponse) {
@@ -302,8 +323,7 @@ function createProxyResponse(originalResponse) {
     'accept-ranges',
     'cache-control',
     'etag',
-    'last-modified',
-    'content-encoding'
+    'last-modified'
   ]
 
   headersToProxy.forEach(header => {
@@ -311,12 +331,10 @@ function createProxyResponse(originalResponse) {
     if (value) headers.set(header, value)
   })
 
-  // Add CORS headers
   headers.set('Access-Control-Allow-Origin', '*')
   headers.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS')
-  headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges, Content-Disposition')
+  headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges')
 
-  // Set cache
   if (!headers.has('cache-control')) {
     headers.set('Cache-Control', 'public, max-age=3600')
   }
