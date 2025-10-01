@@ -1,11 +1,10 @@
-// ULTIMATE Google Drive Proxy - All Problems Fixed
-// Handles: Private files, 403 quota, 408 timeout, public files
+// ULTIMATE Google Drive Proxy - Zero Bandwidth Usage
+// Returns direct Google Drive URLs instead of proxying content
 
 export const config = {
   runtime: 'edge',
 }
 
-// Your service account credentials (hardcoded for maximum reliability)
 const SERVICE_ACCOUNT = {
   "type": "service_account",
   "project_id": "composed-sensor-473512-a9",
@@ -14,7 +13,6 @@ const SERVICE_ACCOUNT = {
   "client_email": "moovied-site@composed-sensor-473512-a9.iam.gserviceaccount.com"
 }
 
-// JWT creation for OAuth
 async function createJWT(serviceAccount) {
   const header = { alg: 'RS256', typ: 'JWT' }
   const now = Math.floor(Date.now() / 1000)
@@ -33,7 +31,6 @@ async function createJWT(serviceAccount) {
   const encodedPayload = encodeBase64Url(payload)
   const signatureInput = `${encodedHeader}.${encodedPayload}`
   
-  // Extract and import private key
   const pemContents = serviceAccount.private_key
     .replace('-----BEGIN PRIVATE KEY-----', '')
     .replace('-----END PRIVATE KEY-----', '')
@@ -61,16 +58,13 @@ async function createJWT(serviceAccount) {
   return `${signatureInput}.${encodedSignature}`
 }
 
-// Get OAuth access token
 async function getAccessToken() {
   const jwt = await createJWT(SERVICE_ACCOUNT)
-
   const response = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`
   })
-
   const data = await response.json()
   return data.access_token
 }
@@ -90,11 +84,12 @@ export default async function handler(request) {
 
   const { searchParams } = new URL(request.url)
   const fileId = searchParams.get('id')
+  const mode = searchParams.get('mode') || 'redirect' // 'redirect' or 'proxy'
 
   if (!fileId) {
     return new Response(JSON.stringify({ 
       error: 'Missing file ID',
-      usage: 'https://moovied-dns.vercel.app/api/download?id=FILE_ID'
+      usage: 'Redirect mode (zero bandwidth): ?id=FILE_ID&mode=redirect\nProxy mode (uses bandwidth): ?id=FILE_ID&mode=proxy'
     }), {
       status: 400,
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
@@ -102,54 +97,66 @@ export default async function handler(request) {
   }
 
   try {
-    const debugInfo = { attempts: [] }
-
-    // STRATEGY 1: Try public methods FIRST (fastest)
-    const publicResult = await tryPublicMethods(fileId, request)
-    if (publicResult.success) {
-      return publicResult.response
+    // MODE 1: REDIRECT (Zero Bandwidth - Recommended for large files)
+    if (mode === 'redirect') {
+      // Try to get direct download URL
+      const directUrl = await getDirectDownloadUrl(fileId)
+      if (directUrl) {
+        return Response.redirect(directUrl, 302)
+      }
+      
+      // Fallback: redirect to Google Drive viewer
+      return Response.redirect(`https://drive.google.com/uc?export=download&id=${fileId}&confirm=t`, 302)
     }
-    debugInfo.attempts.push({ method: 'public', success: false, error: publicResult.error })
 
-    // STRATEGY 2: Try quota bypass methods
-    const bypassResult = await tryQuotaBypass(fileId, request)
-    if (bypassResult.success) {
-      return bypassResult.response
-    }
-    debugInfo.attempts.push({ method: 'quota_bypass', success: false, error: bypassResult.error })
+    // MODE 2: PROXY (Uses Bandwidth - For small files or when redirect fails)
+    if (mode === 'proxy') {
+      // Try public methods first
+      const publicResult = await tryPublicMethods(fileId, request)
+      if (publicResult.success) {
+        return publicResult.response
+      }
 
-    // STRATEGY 3: Try confirmation page extraction
-    const confirmResult = await tryConfirmationPage(fileId, request)
-    if (confirmResult.success) {
-      return confirmResult.response
-    }
-    debugInfo.attempts.push({ method: 'confirmation_page', success: false, error: confirmResult.error })
-
-    // STRATEGY 4: Try authenticated download (for private files)
-    try {
+      // Try with authentication
       const accessToken = await getAccessToken()
       const authResult = await tryAuthDownload(fileId, accessToken, request)
       if (authResult.success) {
         return authResult.response
       }
-      debugInfo.attempts.push({ method: 'authenticated', success: false, error: authResult.error })
-    } catch (e) {
-      debugInfo.attempts.push({ method: 'authenticated', success: false, error: e.message })
+
+      return new Response(JSON.stringify({ 
+        error: 'Download failed',
+        message: 'Unable to proxy file. Try redirect mode instead: ?id=' + fileId + '&mode=redirect'
+      }), {
+        status: 403,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      })
     }
 
-    // All methods failed
+    // DEFAULT: Auto-detect (redirect for large files, proxy for small)
+    const fileInfo = await getFileInfo(fileId)
+    if (fileInfo && fileInfo.size > 50 * 1024 * 1024) { // > 50MB
+      const directUrl = await getDirectDownloadUrl(fileId)
+      if (directUrl) {
+        return Response.redirect(directUrl, 302)
+      }
+    }
+
+    // Small file - proxy it
+    const publicResult = await tryPublicMethods(fileId, request)
+    if (publicResult.success) {
+      return publicResult.response
+    }
+
+    const accessToken = await getAccessToken()
+    const authResult = await tryAuthDownload(fileId, accessToken, request)
+    if (authResult.success) {
+      return authResult.response
+    }
+
     return new Response(JSON.stringify({ 
       error: 'Download failed',
-      message: 'All 4 strategies failed. Check debug info below.',
-      fileId: fileId,
-      serviceAccount: SERVICE_ACCOUNT.client_email,
-      instructions: [
-        '1. For public files: Right-click → Share → "Anyone with the link" → Viewer',
-        '2. For private files: Share with ' + SERVICE_ACCOUNT.client_email,
-        '3. Make sure file exists and is not deleted'
-      ],
-      debug: debugInfo,
-      testUrl: `https://drive.google.com/file/d/${fileId}/view`
+      hint: 'Try: ?id=' + fileId + '&mode=redirect for large files'
     }), {
       status: 403,
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
@@ -166,209 +173,95 @@ export default async function handler(request) {
   }
 }
 
-// Method 1: Authenticated download (for private files)
-async function tryAuthDownload(fileId, accessToken, request) {
-  const endpoints = [
-    `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`,
-    `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`
-  ]
-
-  for (const url of endpoints) {
-    try {
-      const headers = { 'Authorization': `Bearer ${accessToken}`, 'Accept': '*/*' }
-      
-      const rangeHeader = request.headers.get('Range')
-      if (rangeHeader) headers['Range'] = rangeHeader
-
-      const controller = new AbortController()
-      const timeout = setTimeout(() => controller.abort(), 8000)
-
-      const response = await fetch(url, { headers, signal: controller.signal })
-      clearTimeout(timeout)
-
-      if (response.ok || response.status === 206) {
-        return { success: true, response: createProxyResponse(response) }
-      }
-      
-      if (response.status === 404) {
-        return { success: false, error: 'File not found or not shared with service account' }
-      }
-      if (response.status === 403) {
-        return { success: false, error: 'Permission denied - share file with service account' }
-      }
-    } catch (e) {
-      return { success: false, error: e.message }
+// Get file info (size, name, etc.)
+async function getFileInfo(fileId) {
+  try {
+    const accessToken = await getAccessToken()
+    const response = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${fileId}?fields=size,name,mimeType&supportsAllDrives=true`,
+      { headers: { 'Authorization': `Bearer ${accessToken}` } }
+    )
+    if (response.ok) {
+      return await response.json()
     }
+  } catch (e) {
+    return null
   }
-  return { success: false, error: 'All auth endpoints failed' }
+  return null
 }
 
-// Method 2: Public download methods
-async function tryPublicMethods(fileId, request) {
-  const methods = [
-    {
-      url: `https://drive.usercontent.google.com/download?id=${fileId}&export=download&authuser=0&confirm=t`,
-      ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    },
-    {
-      url: `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t`,
-      ua: 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
-    },
-    {
-      url: `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
-      ua: 'curl/8.0.1'
-    },
-    {
-      url: `https://docs.google.com/uc?export=download&id=${fileId}&confirm=t`,
-      ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
-    }
+// Get direct download URL (bypasses quota in many cases)
+async function getDirectDownloadUrl(fileId) {
+  const urls = [
+    `https://drive.usercontent.google.com/download?id=${fileId}&export=download&authuser=0&confirm=t`,
+    `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t`
   ]
-
-  for (const method of methods) {
+  
+  for (const url of urls) {
     try {
-      const headers = { 
-        'User-Agent': method.ua, 
-        'Accept': '*/*',
-        'Referer': 'https://drive.google.com/',
-        'Origin': 'https://drive.google.com'
-      }
-      
-      const rangeHeader = request.headers.get('Range')
-      if (rangeHeader) headers['Range'] = rangeHeader
-
-      const controller = new AbortController()
-      const timeout = setTimeout(() => controller.abort(), 5000)
-
-      const response = await fetch(method.url, { 
-        headers, 
-        signal: controller.signal,
-        redirect: 'follow'
+      const response = await fetch(url, {
+        method: 'HEAD',
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+        redirect: 'manual'
       })
-      clearTimeout(timeout)
-
-      const contentType = response.headers.get('content-type') || ''
-      const contentLength = parseInt(response.headers.get('content-length') || '0')
       
-      // Check if it's a valid file response
-      if ((response.ok || response.status === 206)) {
-        // Skip small HTML error pages
-        if (contentType.includes('text/html') && contentLength < 50000) {
-          continue
-        }
-        if (!contentType.includes('text/html') || contentLength > 50000) {
-          return { success: true, response: createProxyResponse(response) }
-        }
+      // If it redirects or returns OK, this URL works
+      if (response.status === 302 || response.status === 200) {
+        return url
       }
     } catch (e) {
       continue
     }
   }
-  return { success: false, error: 'All public methods returned HTML or failed' }
+  return null
 }
 
-// Method 3: Quota bypass methods
-async function tryQuotaBypass(fileId, request) {
-  const uuid = () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
-    const r = Math.random() * 16 | 0
-    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16)
-  })
+async function tryAuthDownload(fileId, accessToken, request) {
+  try {
+    const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`
+    const headers = { 'Authorization': `Bearer ${accessToken}`, 'Accept': '*/*' }
+    
+    const rangeHeader = request.headers.get('Range')
+    if (rangeHeader) headers['Range'] = rangeHeader
 
+    const response = await fetch(url, { headers })
+
+    if (response.ok || response.status === 206) {
+      return { success: true, response: createProxyResponse(response) }
+    }
+  } catch (e) {
+    return { success: false }
+  }
+  return { success: false }
+}
+
+async function tryPublicMethods(fileId, request) {
   const methods = [
-    { url: `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t&uuid=${uuid()}`, ua: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15' },
-    { url: `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t&uuid=${uuid()}`, ua: 'curl/7.88.0' },
-    { url: `https://docs.google.com/uc?id=${fileId}&export=download`, ua: 'Wget/1.21.3' },
-    { url: `https://drive.google.com/uc?export=download&id=${fileId}`, ua: 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36' }
+    {
+      url: `https://drive.usercontent.google.com/download?id=${fileId}&export=download&authuser=0&confirm=t`,
+      ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    },
+    {
+      url: `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t`,
+      ua: 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
+    }
   ]
 
   for (const method of methods) {
     try {
-      const controller = new AbortController()
-      const timeout = setTimeout(() => controller.abort(), 5000)
+      const headers = { 'User-Agent': method.ua, 'Accept': '*/*' }
+      const rangeHeader = request.headers.get('Range')
+      if (rangeHeader) headers['Range'] = rangeHeader
 
-      const response = await fetch(method.url, {
-        headers: { 'User-Agent': method.ua, 'Accept': '*/*' },
-        signal: controller.signal
-      })
-      clearTimeout(timeout)
-
+      const response = await fetch(method.url, { headers, redirect: 'follow' })
       const contentType = response.headers.get('content-type') || ''
+      
       if ((response.ok || response.status === 206) && !contentType.includes('text/html')) {
         return { success: true, response: createProxyResponse(response) }
       }
     } catch (e) {
       continue
     }
-  }
-  return { success: false }
-}
-
-// Method 4: Confirmation page extraction
-async function tryConfirmationPage(fileId, request) {
-  try {
-    const confirmUrl = `https://drive.google.com/uc?export=download&id=${fileId}`
-    
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 8000)
-
-    const response = await fetch(confirmUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'text/html'
-      },
-      signal: controller.signal
-    })
-    clearTimeout(timeout)
-
-    if (!response.ok) return { success: false }
-
-    const html = await response.text()
-    
-    const patterns = [
-      /href="(https:\/\/drive\.usercontent\.google\.com\/download\?[^"]+)"/i,
-      /href="(https:\/\/[^"]*uc\?export=download[^"]*confirm=[^"]*uuid=[^"]*)"/i,
-      /"downloadUrl"\s*:\s*"([^"]+)"/i,
-      /action="([^"]*uc\?export=download[^"]*)"/i,
-      /href="(\/uc\?export=download&[^"]+)"/i
-    ]
-
-    for (const pattern of patterns) {
-      const match = html.match(pattern)
-      if (match) {
-        let downloadUrl = match[1]
-          .replace(/&amp;/g, '&')
-          .replace(/\\u003d/g, '=')
-          .replace(/\\u0026/g, '&')
-          .replace(/\\\//g, '/')
-
-        if (downloadUrl.startsWith('/')) {
-          downloadUrl = 'https://drive.google.com' + downloadUrl
-        }
-
-        try {
-          const finalController = new AbortController()
-          const finalTimeout = setTimeout(() => finalController.abort(), 6000)
-
-          const finalResponse = await fetch(downloadUrl, {
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-              'Referer': confirmUrl,
-              'Accept': '*/*'
-            },
-            signal: finalController.signal
-          })
-          clearTimeout(finalTimeout)
-
-          const contentType = finalResponse.headers.get('content-type') || ''
-          if (finalResponse.ok && !contentType.includes('text/html')) {
-            return { success: true, response: createProxyResponse(finalResponse) }
-          }
-        } catch (e) {
-          continue
-        }
-      }
-    }
-  } catch (e) {
-    return { success: false }
   }
   return { success: false }
 }
