@@ -110,7 +110,23 @@ export default async function handler(request) {
   try {
     const attempts = []
 
-    // STRATEGY 1: UUID + Confirm bypass (best for quota limits)
+    // STRATEGY 1: Confirmation page extraction (BEST for large files)
+    const confirmUrl = await extractConfirmationUrl(fileId)
+    if (confirmUrl) {
+      attempts.push({ method: 'confirmation_page', success: true })
+      if (action === 'download') {
+        return Response.redirect(confirmUrl, 302)
+      }
+      return jsonResponse({
+        success: true,
+        downloadUrl: confirmUrl,
+        method: 'confirmation_extraction',
+        fileId: fileId
+      })
+    }
+    attempts.push({ method: 'confirmation_page', success: false })
+
+    // STRATEGY 2: UUID + Confirm bypass (best for quota limits)
     const uuidUrls = await getQuotaBypassUrls(fileId)
     for (const url of uuidUrls) {
       const result = await testUrl(url.url, url.headers)
@@ -128,22 +144,6 @@ export default async function handler(request) {
       }
       attempts.push({ method: 'uuid_bypass', success: false })
     }
-
-    // STRATEGY 2: Confirmation page extraction
-    const confirmUrl = await extractConfirmationUrl(fileId)
-    if (confirmUrl) {
-      attempts.push({ method: 'confirmation_page', success: true })
-      if (action === 'download') {
-        return Response.redirect(confirmUrl, 302)
-      }
-      return jsonResponse({
-        success: true,
-        downloadUrl: confirmUrl,
-        method: 'confirmation_extraction',
-        fileId: fileId
-      })
-    }
-    attempts.push({ method: 'confirmation_page', success: false })
 
     // STRATEGY 3: Public direct URLs
     const publicUrl = await getPublicDownloadUrl(fileId)
@@ -240,55 +240,109 @@ async function getQuotaBypassUrls(fileId) {
   ]
 }
 
-// Extract download URL from confirmation page (for large files)
+// Extract download URL from confirmation page (for large files with "Download anyway" button)
 async function extractConfirmationUrl(fileId) {
   try {
-    const confirmUrl = `https://drive.google.com/uc?export=download&id=${fileId}`
-    
-    const response = await fetch(confirmUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'text/html',
-        'X-Forwarded-For': randomIP()
-      },
-      signal: AbortSignal.timeout(6000)
-    })
-
-    if (!response.ok) return null
-
-    const html = await response.text()
-    
-    // Multiple patterns to extract download URL
-    const patterns = [
-      /href="(https:\/\/drive\.usercontent\.google\.com\/download\?[^"]+)"/i,
-      /href="(https:\/\/[^"]*uc\?export=download[^"]*confirm=[^"]*uuid=[^"]*)"/i,
-      /"downloadUrl"\s*:\s*"([^"]+)"/i,
-      /action="([^"]*uc\?export=download[^"]*)"/i,
-      /href="(\/uc\?export=download&[^"]+)"/i,
-      /<a[^>]*id="uc-download-link"[^>]*href="([^"]+)"/i
+    // Try multiple confirmation URLs
+    const confirmUrls = [
+      `https://drive.google.com/uc?export=download&id=${fileId}`,
+      `https://drive.usercontent.google.com/download?id=${fileId}&export=download&authuser=0`,
+      `https://docs.google.com/uc?export=download&id=${fileId}`
     ]
 
-    for (const pattern of patterns) {
-      const match = html.match(pattern)
-      if (match) {
-        let downloadUrl = match[1]
-          .replace(/&amp;/g, '&')
-          .replace(/\\u003d/g, '=')
-          .replace(/\\u0026/g, '&')
-          .replace(/\\\//g, '/')
+    for (const confirmUrl of confirmUrls) {
+      const response = await fetch(confirmUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'X-Forwarded-For': randomIP()
+        },
+        signal: AbortSignal.timeout(8000)
+      })
 
-        if (downloadUrl.startsWith('/')) {
-          downloadUrl = 'https://drive.google.com' + downloadUrl
-        }
+      if (!response.ok) continue
 
-        // Verify the URL works
-        const testResult = await testUrl(downloadUrl, {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-          'Referer': confirmUrl
-        })
+      const html = await response.text()
+      
+      // Enhanced patterns to extract download URL (including "Download anyway" button)
+      const patterns = [
+        // Direct download links in HTML
+        /href="(https:\/\/drive\.usercontent\.google\.com\/download\?[^"]+)"/i,
+        /href="(https:\/\/drive\.usercontent\.google\.com\/[^"]+)"/i,
+        /href="(https:\/\/[^"]*uc\?export=download[^"]*confirm=[^"]*uuid=[^"]*)"/i,
+        
+        // Download form action
+        /<form[^>]*action="([^"]*uc\?export=download[^"]*)"/i,
+        /<form[^>]*id="download-form"[^>]*action="([^"]+)"/i,
+        
+        // Download button link
+        /<a[^>]*id="uc-download-link"[^>]*href="([^"]+)"/i,
+        /<a[^>]*download[^>]*href="([^"]+)"/i,
+        
+        // JSON embedded data
+        /"downloadUrl"\s*:\s*"([^"]+)"/i,
+        /"url"\s*:\s*"(https:\/\/drive\.usercontent\.google\.com[^"]+)"/i,
+        
+        // Relative URLs
+        /href="(\/uc\?export=download&[^"]+)"/i,
+        /action="(\/uc\?export=download[^"]+)"/i
+      ]
 
-        if (testResult.success) {
-          return downloadUrl
+      for (const pattern of patterns) {
+        const match = html.match(pattern)
+        if (match) {
+          let downloadUrl = match[1]
+            .replace(/&amp;/g, '&')
+            .replace(/\\u003d/g, '=')
+            .replace(/\\u0026/g, '&')
+            .replace(/\\\//g, '/')
+            .replace(/\\"/g, '"')
+
+          // Convert relative URLs to absolute
+          if (downloadUrl.startsWith('/')) {
+            downloadUrl = 'https://drive.google.com' + downloadUrl
+          }
+
+          // Add confirm parameter if missing
+          if (!downloadUrl.includes('confirm=')) {
+            downloadUrl += (downloadUrl.includes('?') ? '&' : '?') + 'confirm=t'
+          }
+
+          // Try to fetch with this URL - use GET request to verify it's a real file
+          try {
+            const testResponse = await fetch(downloadUrl, {
+              method: 'GET',
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': confirmUrl,
+                'Accept': '*/*'
+              },
+              signal: AbortSignal.timeout(5000),
+              redirect: 'manual' // Don't follow redirects, just check if it's valid
+            })
+
+            const contentType = testResponse.headers.get('content-type') || ''
+            const contentLength = parseInt(testResponse.headers.get('content-length') || '0')
+            
+            // Valid if: redirecting to download OR returning file content
+            if (testResponse.status === 302 || testResponse.status === 301) {
+              const location = testResponse.headers.get('location')
+              if (location) return location
+            }
+            
+            if ((testResponse.ok || testResponse.status === 206) && !contentType.includes('text/html')) {
+              return downloadUrl
+            }
+            
+            // Large file (even if HTML, might be valid)
+            if (contentLength > 1000000) {
+              return downloadUrl
+            }
+          } catch (e) {
+            // If fetch fails, try next pattern
+            continue
+          }
         }
       }
     }
