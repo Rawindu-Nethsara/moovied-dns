@@ -1,5 +1,6 @@
-// ULTIMATE Google Drive Proxy - Zero Bandwidth Usage
-// Returns direct Google Drive URLs instead of proxying content
+// Google Drive Download - Quota Bypass + Direct Download
+// Handles: 24h quota limits, unlimited downloads, large files (10GB+)
+// Strategy: Multiple endpoints, user-agent rotation, confirmation bypass
 
 export const config = {
   runtime: 'edge',
@@ -69,6 +70,16 @@ async function getAccessToken() {
   return data.access_token
 }
 
+// Generate unique identifiers for quota bypass
+const uuid = () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+  const r = Math.random() * 16 | 0
+  return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16)
+})
+
+const randomIP = () => {
+  return `${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`
+}
+
 export default async function handler(request) {
   if (request.method === 'OPTIONS') {
     return new Response(null, {
@@ -76,7 +87,7 @@ export default async function handler(request) {
       headers: {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Range',
+        'Access-Control-Allow-Headers': 'Content-Type',
         'Access-Control-Max-Age': '86400'
       }
     })
@@ -84,12 +95,12 @@ export default async function handler(request) {
 
   const { searchParams } = new URL(request.url)
   const fileId = searchParams.get('id')
-  const mode = searchParams.get('mode') || 'redirect' // 'redirect' or 'proxy'
+  const action = searchParams.get('action') // 'url' or 'download'
 
   if (!fileId) {
     return new Response(JSON.stringify({ 
       error: 'Missing file ID',
-      usage: 'Redirect mode (zero bandwidth): ?id=FILE_ID&mode=redirect\nProxy mode (uses bandwidth): ?id=FILE_ID&mode=proxy'
+      usage: 'Add ?id=FILE_ID&action=url or ?id=FILE_ID&action=download'
     }), {
       status: 400,
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
@@ -97,92 +108,189 @@ export default async function handler(request) {
   }
 
   try {
-    // MODE 1: REDIRECT (Zero Bandwidth - Recommended for large files)
-    if (mode === 'redirect') {
-      // Try to get direct download URL
-      const directUrl = await getDirectDownloadUrl(fileId)
-      if (directUrl) {
-        return Response.redirect(directUrl, 302)
+    const attempts = []
+
+    // STRATEGY 1: UUID + Confirm bypass (best for quota limits)
+    const uuidUrls = await getQuotaBypassUrls(fileId)
+    for (const url of uuidUrls) {
+      const result = await testUrl(url.url, url.headers)
+      if (result.success) {
+        attempts.push({ method: 'uuid_bypass', success: true })
+        if (action === 'download') {
+          return Response.redirect(url.url, 302)
+        }
+        return jsonResponse({
+          success: true,
+          downloadUrl: url.url,
+          method: 'quota_bypass',
+          fileId: fileId
+        })
       }
-      
-      // Fallback: redirect to Google Drive viewer
-      return Response.redirect(`https://drive.google.com/uc?export=download&id=${fileId}&confirm=t`, 302)
+      attempts.push({ method: 'uuid_bypass', success: false })
     }
 
-    // MODE 2: PROXY (Uses Bandwidth - For small files or when redirect fails)
-    if (mode === 'proxy') {
-      // Try public methods first
-      const publicResult = await tryPublicMethods(fileId, request)
-      if (publicResult.success) {
-        return publicResult.response
+    // STRATEGY 2: Confirmation page extraction
+    const confirmUrl = await extractConfirmationUrl(fileId)
+    if (confirmUrl) {
+      attempts.push({ method: 'confirmation_page', success: true })
+      if (action === 'download') {
+        return Response.redirect(confirmUrl, 302)
       }
-
-      // Try with authentication
-      const accessToken = await getAccessToken()
-      const authResult = await tryAuthDownload(fileId, accessToken, request)
-      if (authResult.success) {
-        return authResult.response
-      }
-
-      return new Response(JSON.stringify({ 
-        error: 'Download failed',
-        message: 'Unable to proxy file. Try redirect mode instead: ?id=' + fileId + '&mode=redirect'
-      }), {
-        status: 403,
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      return jsonResponse({
+        success: true,
+        downloadUrl: confirmUrl,
+        method: 'confirmation_extraction',
+        fileId: fileId
       })
     }
+    attempts.push({ method: 'confirmation_page', success: false })
 
-    // DEFAULT: Auto-detect (redirect for large files, proxy for small)
-    const fileInfo = await getFileInfo(fileId)
-    if (fileInfo && fileInfo.size > 50 * 1024 * 1024) { // > 50MB
-      const directUrl = await getDirectDownloadUrl(fileId)
-      if (directUrl) {
-        return Response.redirect(directUrl, 302)
+    // STRATEGY 3: Public direct URLs
+    const publicUrl = await getPublicDownloadUrl(fileId)
+    if (publicUrl) {
+      attempts.push({ method: 'public_url', success: true })
+      if (action === 'download') {
+        return Response.redirect(publicUrl, 302)
       }
+      return jsonResponse({
+        success: true,
+        downloadUrl: publicUrl,
+        method: 'public_direct',
+        fileId: fileId
+      })
+    }
+    attempts.push({ method: 'public_url', success: false })
+
+    // STRATEGY 4: Authenticated download (service account)
+    try {
+      const accessToken = await getAccessToken()
+      const authUrl = await getAuthenticatedDownloadUrl(fileId, accessToken)
+      
+      if (authUrl) {
+        attempts.push({ method: 'authenticated', success: true })
+        if (action === 'download') {
+          return Response.redirect(authUrl, 302)
+        }
+        return jsonResponse({
+          success: true,
+          downloadUrl: authUrl,
+          method: 'service_account',
+          fileId: fileId,
+          note: 'Token expires in 1 hour'
+        })
+      }
+      attempts.push({ method: 'authenticated', success: false })
+    } catch (e) {
+      attempts.push({ method: 'authenticated', success: false, error: e.message })
     }
 
-    // Small file - proxy it
-    const publicResult = await tryPublicMethods(fileId, request)
-    if (publicResult.success) {
-      return publicResult.response
-    }
-
-    const accessToken = await getAccessToken()
-    const authResult = await tryAuthDownload(fileId, accessToken, request)
-    if (authResult.success) {
-      return authResult.response
-    }
-
-    return new Response(JSON.stringify({ 
-      error: 'Download failed',
-      hint: 'Try: ?id=' + fileId + '&mode=redirect for large files'
-    }), {
-      status: 403,
-      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-    })
+    // All methods failed
+    return jsonResponse({ 
+      error: 'All download methods failed',
+      fileId: fileId,
+      attempts: attempts,
+      instructions: [
+        '1. Make file public: Share → Anyone with the link → Viewer',
+        '2. OR share with: ' + SERVICE_ACCOUNT.client_email,
+        '3. Check if file exists: https://drive.google.com/file/d/' + fileId + '/view'
+      ]
+    }, 403)
 
   } catch (error) {
-    return new Response(JSON.stringify({ 
+    return jsonResponse({ 
       error: 'Server error',
       message: error.message
-    }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-    })
+    }, 500)
   }
 }
 
-// Get file info (size, name, etc.)
-async function getFileInfo(fileId) {
+// QUOTA BYPASS: Generate URLs with UUID + various user agents
+async function getQuotaBypassUrls(fileId) {
+  const uniqueId = uuid()
+  
+  return [
+    {
+      url: `https://drive.usercontent.google.com/download?id=${fileId}&export=download&authuser=0&confirm=t&uuid=${uniqueId}`,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'X-Forwarded-For': randomIP()
+      }
+    },
+    {
+      url: `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t&uuid=${uniqueId}`,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
+        'X-Forwarded-For': randomIP()
+      }
+    },
+    {
+      url: `https://docs.google.com/uc?id=${fileId}&export=download&confirm=t&uuid=${uniqueId}`,
+      headers: {
+        'User-Agent': 'curl/8.4.0',
+        'X-Forwarded-For': randomIP()
+      }
+    },
+    {
+      url: `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=AIzaSyC1eQ1xj69IdTMeii5r7brs3R90ek85noj`,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 13)',
+        'X-Forwarded-For': randomIP()
+      }
+    }
+  ]
+}
+
+// Extract download URL from confirmation page (for large files)
+async function extractConfirmationUrl(fileId) {
   try {
-    const accessToken = await getAccessToken()
-    const response = await fetch(
-      `https://www.googleapis.com/drive/v3/files/${fileId}?fields=size,name,mimeType&supportsAllDrives=true`,
-      { headers: { 'Authorization': `Bearer ${accessToken}` } }
-    )
-    if (response.ok) {
-      return await response.json()
+    const confirmUrl = `https://drive.google.com/uc?export=download&id=${fileId}`
+    
+    const response = await fetch(confirmUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html',
+        'X-Forwarded-For': randomIP()
+      },
+      signal: AbortSignal.timeout(6000)
+    })
+
+    if (!response.ok) return null
+
+    const html = await response.text()
+    
+    // Multiple patterns to extract download URL
+    const patterns = [
+      /href="(https:\/\/drive\.usercontent\.google\.com\/download\?[^"]+)"/i,
+      /href="(https:\/\/[^"]*uc\?export=download[^"]*confirm=[^"]*uuid=[^"]*)"/i,
+      /"downloadUrl"\s*:\s*"([^"]+)"/i,
+      /action="([^"]*uc\?export=download[^"]*)"/i,
+      /href="(\/uc\?export=download&[^"]+)"/i,
+      /<a[^>]*id="uc-download-link"[^>]*href="([^"]+)"/i
+    ]
+
+    for (const pattern of patterns) {
+      const match = html.match(pattern)
+      if (match) {
+        let downloadUrl = match[1]
+          .replace(/&amp;/g, '&')
+          .replace(/\\u003d/g, '=')
+          .replace(/\\u0026/g, '&')
+          .replace(/\\\//g, '/')
+
+        if (downloadUrl.startsWith('/')) {
+          downloadUrl = 'https://drive.google.com' + downloadUrl
+        }
+
+        // Verify the URL works
+        const testResult = await testUrl(downloadUrl, {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+          'Referer': confirmUrl
+        })
+
+        if (testResult.success) {
+          return downloadUrl
+        }
+      }
     }
   } catch (e) {
     return null
@@ -190,106 +298,84 @@ async function getFileInfo(fileId) {
   return null
 }
 
-// Get direct download URL (bypasses quota in many cases)
-async function getDirectDownloadUrl(fileId) {
-  const urls = [
-    `https://drive.usercontent.google.com/download?id=${fileId}&export=download&authuser=0&confirm=t`,
-    `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t`
-  ]
-  
-  for (const url of urls) {
-    try {
-      const response = await fetch(url, {
-        method: 'HEAD',
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-        redirect: 'manual'
-      })
-      
-      // If it redirects or returns OK, this URL works
-      if (response.status === 302 || response.status === 200) {
-        return url
-      }
-    } catch (e) {
-      continue
-    }
-  }
-  return null
-}
-
-async function tryAuthDownload(fileId, accessToken, request) {
-  try {
-    const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`
-    const headers = { 'Authorization': `Bearer ${accessToken}`, 'Accept': '*/*' }
-    
-    const rangeHeader = request.headers.get('Range')
-    if (rangeHeader) headers['Range'] = rangeHeader
-
-    const response = await fetch(url, { headers })
-
-    if (response.ok || response.status === 206) {
-      return { success: true, response: createProxyResponse(response) }
-    }
-  } catch (e) {
-    return { success: false }
-  }
-  return { success: false }
-}
-
-async function tryPublicMethods(fileId, request) {
+// Generate standard public download URL
+async function getPublicDownloadUrl(fileId) {
   const methods = [
     {
       url: `https://drive.usercontent.google.com/download?id=${fileId}&export=download&authuser=0&confirm=t`,
-      ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      ua: 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
     },
     {
       url: `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t`,
-      ua: 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
+      ua: 'Wget/1.21.4'
     }
   ]
 
   for (const method of methods) {
-    try {
-      const headers = { 'User-Agent': method.ua, 'Accept': '*/*' }
-      const rangeHeader = request.headers.get('Range')
-      if (rangeHeader) headers['Range'] = rangeHeader
-
-      const response = await fetch(method.url, { headers, redirect: 'follow' })
-      const contentType = response.headers.get('content-type') || ''
-      
-      if ((response.ok || response.status === 206) && !contentType.includes('text/html')) {
-        return { success: true, response: createProxyResponse(response) }
-      }
-    } catch (e) {
-      continue
+    const result = await testUrl(method.url, { 'User-Agent': method.ua })
+    if (result.success) {
+      return method.url
     }
   }
-  return { success: false }
+
+  return null
 }
 
-function createProxyResponse(originalResponse) {
-  const headers = new Headers()
-  
-  const headersToProxy = [
-    'content-type', 'content-length', 'content-disposition',
-    'content-range', 'accept-ranges', 'cache-control',
-    'etag', 'last-modified'
+// Generate authenticated download URL (for private files)
+async function getAuthenticatedDownloadUrl(fileId, accessToken) {
+  const urls = [
+    `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`,
+    `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`
   ]
-
-  headersToProxy.forEach(header => {
-    const value = originalResponse.headers.get(header)
-    if (value) headers.set(header, value)
-  })
-
-  headers.set('Access-Control-Allow-Origin', '*')
-  headers.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS')
-  headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges')
-
-  if (!headers.has('cache-control')) {
-    headers.set('Cache-Control', 'public, max-age=3600')
+  
+  for (const baseUrl of urls) {
+    const result = await testUrl(baseUrl, {
+      'Authorization': `Bearer ${accessToken}`
+    })
+    
+    if (result.success) {
+      return `${baseUrl}&access_token=${accessToken}`
+    }
   }
 
-  return new Response(originalResponse.body, {
-    status: originalResponse.status,
-    headers: headers
+  return null
+}
+
+// Test if URL is valid (returns file, not error page)
+async function testUrl(url, headers = {}) {
+  try {
+    const response = await fetch(url, { 
+      method: 'HEAD',
+      headers: headers,
+      signal: AbortSignal.timeout(4000)
+    })
+    
+    const contentType = response.headers.get('content-type') || ''
+    const contentLength = parseInt(response.headers.get('content-length') || '0')
+    
+    // Valid if: OK status AND (not HTML OR large HTML file)
+    if (response.ok) {
+      if (!contentType.includes('text/html')) {
+        return { success: true }
+      }
+      if (contentLength > 50000) {
+        return { success: true }
+      }
+    }
+    
+    return { success: false }
+  } catch (e) {
+    return { success: false }
+  }
+}
+
+// Helper to create JSON responses
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status: status,
+    headers: { 
+      'Content-Type': 'application/json', 
+      'Access-Control-Allow-Origin': '*' 
+    }
   })
 }
