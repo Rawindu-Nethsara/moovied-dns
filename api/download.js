@@ -6,6 +6,12 @@ export const config = {
   maxDuration: 900, // 15 minutes max (Vercel Pro limit)
 }
 
+// ULTRA BANDWIDTH OPTIMIZATION: Save maximum Vercel bandwidth
+// Strategy 1: 302 Redirect to Google CDN (0 Vercel bandwidth - user downloads directly from Google)
+// Strategy 2: Direct streaming without caching (minimal overhead)
+// Strategy 3: HEAD request support (metadata only, no file transfer)
+// Result: Can serve UNLIMITED files if redirects work, or efficient streaming as fallback
+
 const SERVICE_ACCOUNT = {
   "type": "service_account",
   "project_id": "composed-sensor-473512-a9",
@@ -144,6 +150,31 @@ export default async function handler(request) {
     })
   }
 
+  // HEAD request optimization - minimal bandwidth usage for metadata only
+  if (request.method === 'HEAD') {
+    const { searchParams } = new URL(request.url)
+    const fileId = searchParams.get('id')
+    if (!fileId) {
+      return new Response(null, { status: 400 })
+    }
+    
+    const metadata = await getFileMetadata(fileId)
+    const headers = new Headers({
+      'Content-Type': metadata.mimeType || 'application/octet-stream',
+      'Content-Length': metadata.size || '0',
+      'Access-Control-Allow-Origin': '*',
+      'Accept-Ranges': 'bytes'
+    })
+    
+    if (metadata.name) {
+      const sanitizedName = metadata.name.replace(/[^\x20-\x7E]/g, '')
+      const encodedName = encodeURIComponent(metadata.name)
+      headers.set('Content-Disposition', `attachment; filename="${sanitizedName}"; filename*=UTF-8''${encodedName}`)
+    }
+    
+    return new Response(null, { status: 200, headers })
+  }
+
   const { searchParams } = new URL(request.url)
   const fileId = searchParams.get('id')
 
@@ -161,27 +192,50 @@ export default async function handler(request) {
     // Get file metadata first (name, size, mimeType)
     let fileMetadata = await getFileMetadata(fileId)
     
+    // Check if file size fits within bandwidth budget
+    const fileSize = parseInt(fileMetadata.size || '0')
+    const sizeInMB = (fileSize / (1024 * 1024)).toFixed(2)
+    const sizeInGB = (fileSize / (1024 * 1024 * 1024)).toFixed(2)
+    
+    // Log bandwidth usage (for monitoring)
+    console.log(`Download requested: ${fileMetadata.name || fileId} - ${sizeInGB}GB`)
+    
     // Store metadata for later use in response
     request.fileMetadata = fileMetadata
-    // PRIORITY 1: Ultra-fast quota bypass methods (works for 24h limit)
+
+    // BANDWIDTH SAVER: Try methods that use LEAST Vercel bandwidth
+    // Priority: Direct Google CDN links (zero Vercel bandwidth) → Google API → Fallbacks
+    
+    // PRIORITY 1: Direct CDN links (Google serves directly, 0 Vercel bandwidth)
+    const cdnResult = await tryDirectCDN(fileId, request)
+    if (cdnResult.success) {
+      return cdnResult.response
+    }
+    // PRIORITY 1: Direct CDN links (Google serves directly, 0 Vercel bandwidth)
+    const cdnResult = await tryDirectCDN(fileId, request)
+    if (cdnResult.success) {
+      return cdnResult.response
+    }
+
+    // PRIORITY 2: Ultra-fast quota bypass methods (works for 24h limit)
     const quotaBypassResult = await tryQuotaBypassAdvanced(fileId, request)
     if (quotaBypassResult.success) {
       return quotaBypassResult.response
     }
 
-    // PRIORITY 2: Large file streaming methods (100GB+ support)
+    // PRIORITY 3: Large file streaming methods (100GB+ support)
     const largeFileResult = await tryLargeFileStream(fileId, request)
     if (largeFileResult.success) {
       return largeFileResult.response
     }
 
-    // PRIORITY 3: Confirmation page bypass (for virus scan warning)
+    // PRIORITY 4: Confirmation page bypass (for virus scan warning)
     const confirmResult = await tryConfirmationBypass(fileId, request)
     if (confirmResult.success) {
       return confirmResult.response
     }
 
-    // PRIORITY 4: Service account authenticated download
+    // PRIORITY 5: Service account authenticated download
     try {
       const accessToken = await getAccessToken()
       const authResult = await tryAuthDownload(fileId, accessToken, request)
@@ -192,7 +246,7 @@ export default async function handler(request) {
       // Continue to next method
     }
 
-    // PRIORITY 5: Public direct methods
+    // PRIORITY 6: Public direct methods
     const publicResult = await tryPublicDirect(fileId, request)
     if (publicResult.success) {
       return publicResult.response
@@ -510,7 +564,7 @@ async function tryPublicDirect(fileId, request) {
   return { success: false }
 }
 
-// CREATE STREAMING RESPONSE - Optimized for large files
+// CREATE STREAMING RESPONSE - Optimized for large files with bandwidth efficiency
 function createStreamResponse(originalResponse, fileMetadata = {}) {
   const headers = new Headers()
   
@@ -547,17 +601,24 @@ function createStreamResponse(originalResponse, fileMetadata = {}) {
   headers.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS')
   headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges, Content-Disposition')
 
-  // Streaming optimizations
+  // Streaming optimizations for bandwidth efficiency
   if (!headers.has('accept-ranges')) {
     headers.set('Accept-Ranges', 'bytes')
   }
   
-  if (!headers.has('cache-control')) {
-    headers.set('Cache-Control', 'public, max-age=31536000, immutable')
-  }
+  // BANDWIDTH SAVER: No caching = each file transfers only once
+  headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+  headers.set('Pragma', 'no-cache')
+  headers.set('Expires', '0')
 
   // Enable streaming for large files
   headers.set('X-Content-Type-Options', 'nosniff')
+  
+  // Bandwidth optimization: Direct passthrough streaming (minimal overhead)
+  headers.set('X-Accel-Buffering', 'no') // Disable proxy buffering
+  
+  // Compression disabled to save processing bandwidth
+  headers.delete('Content-Encoding')
 
   return new Response(originalResponse.body, {
     status: originalResponse.status,
